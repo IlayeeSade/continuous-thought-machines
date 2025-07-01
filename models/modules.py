@@ -228,7 +228,7 @@ class SuperLinear(nn.Module):
         # b1: (1, D=N neurons, H)
         # einsum result: (B, D, H)
         # Applying bias requires matching shapes, b1 is broadcasted.
-        out = torch.einsum('BDM,MHD->BDH', out, self.w1) + self.b1
+        out = torch.einsum('BODM,MHD->BODH', out, self.w1) + self.b1
 
         # Squeeze the output dimension (assumed to be 1 usually) and scale by T
         # This matches the original code's structure exactly.
@@ -583,6 +583,96 @@ class MultiLearnableFourierPositionalEncoding(nn.Module):
         combined_emb = (pos_embs * weights).sum(0) # (B, D, H, W)
         return combined_emb
 
+
+class MultiLearnableFourierPositionalEncoding1D(nn.Module):
+    def __init__(self, d_model,
+                 G=1, M=2,
+                 F_dim=256,
+                 H_dim=128,
+                 gamma_range=[1.0, 0.1],
+                 N=10,
+                 ):
+        super().__init__()
+        self.embedders = nn.ModuleList()
+        # The d_model in this context is the channel dimension of the input
+        # which corresponds to C in the (B, D, C) format.
+        for gamma in np.linspace(gamma_range[0], gamma_range[1], N):
+            self.embedders.append(LearnableFourierPositionalEncoding(d_model, G, M, F_dim, H_dim, gamma))
+
+        self.register_parameter('combination', torch.nn.Parameter(torch.ones(N), requires_grad=True))
+        self.N = N
+        self.d_model = d_model
+
+    def forward(self, x):
+        # x: (B, D, C)
+        # Reshape to (B, C, 1, D) to mimic (B, C, H, W)
+        x_reshaped = x.permute(0, 2, 1).unsqueeze(2)
+
+        # The output of each embedder will be (B, d_model, 1, D)
+        # where d_model is the output dimension of the encoding.
+        # Note: The original d_model argument now defines the output dim, not input channel.
+        pos_embs = torch.stack([emb(x_reshaped) for emb in self.embedders], dim=0)
+
+        weights = F.softmax(self.combination, dim=-1).view(self.N, 1, 1, 1, 1)
+        combined_emb = (pos_embs * weights).sum(0)
+
+        # Reshape from (B, d_model, 1, D) back to (B, D, d_model)
+        output = combined_emb.squeeze(2).permute(0, 2, 1)
+        return output
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    Standard sinusoidal positional encoding, as described in
+    "Attention Is All You Need". This is a non-learnable, fixed
+    encoding that depends only on the position in the sequence.
+
+    Args:
+        d_model (int): The embedding dimension (required).
+        dropout (float): The dropout probability.
+        max_len (int): The maximum sequence length.
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        
+        # Register 'pe' as a buffer, so it's part of the model's state
+        # but not considered a parameter to be trained.
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Adds positional encoding to the input tensor.
+
+        Args:
+            x (torch.Tensor): The input tensor of shape (S, B, D),
+                              where S is the sequence length, B is the
+                              batch size, and D is the embedding dimension.
+                              Or (B, S, D) if batch_first=True.
+
+        Returns:
+            torch.Tensor: The input tensor with positional encodings added.
+        """
+        # Assume x is (Batch, SeqLen, Dim)
+        if x.dim() == 3:
+            x = x + self.pe[:x.size(1)].transpose(0, 1)
+        # Assume x is (SeqLen, Batch, Dim)
+        elif x.dim() == 2:
+             x = x.unsqueeze(1)
+             x = x + self.pe[:x.size(0)]
+             x = x.squeeze(1)
+        else: # (SeqLen, Batch, Dim)
+            x = x + self.pe[:x.size(0)]
+
+        return self.dropout(x)
 
 class CustomRotationalEmbedding(nn.Module):
     """

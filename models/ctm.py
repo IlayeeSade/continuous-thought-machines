@@ -88,6 +88,7 @@ class ContinuousThoughtMachine(nn.Module):
                  memory_length,
                  deep_nlms,
                  memory_hidden_dims,
+                 context_dims,
                  do_layernorm_nlm,
                  backbone_type,
                  positional_embedding_type,
@@ -105,6 +106,7 @@ class ContinuousThoughtMachine(nn.Module):
         self.d_model = d_model
         self.d_input = d_input
         self.memory_length = memory_length
+        self.context_dims = context_dims
         self.prediction_reshaper = prediction_reshaper
         self.n_synch_out = n_synch_out
         self.n_synch_action = n_synch_action
@@ -119,10 +121,8 @@ class ContinuousThoughtMachine(nn.Module):
         self.verify_args()
 
         # --- Input Processing  ---
-        d_backbone = self.get_d_backbone()
-        self.set_initial_rgb()
         self.set_backbone()
-        self.positional_embedding = self.get_positional_embedding(d_backbone)
+        self.positional_embedding = self.get_positional_embedding(self.context_dims)
         self.kv_proj = nn.Sequential(nn.LazyLinear(self.d_input), nn.LayerNorm(self.d_input)) if heads else None
         self.q_proj = nn.LazyLinear(self.d_input) if heads else None
         self.attention = nn.MultiheadAttention(self.d_input, heads, dropout, batch_first=True) if heads else None
@@ -132,8 +132,8 @@ class ContinuousThoughtMachine(nn.Module):
         self.trace_processor = self.get_neuron_level_models(deep_nlms, do_layernorm_nlm, memory_length, memory_hidden_dims, d_model, dropout_nlm)
 
         #  --- Start States ---
-        self.register_parameter('start_activated_state', nn.Parameter(torch.zeros((d_model)).uniform_(-math.sqrt(1/(d_model)), math.sqrt(1/(d_model)))))
-        self.register_parameter('start_trace', nn.Parameter(torch.zeros((d_model, memory_length)).uniform_(-math.sqrt(1/(d_model+memory_length)), math.sqrt(1/(d_model+memory_length)))))
+        self.register_parameter('start_activated_state', nn.Parameter(torch.zeros((self.context_dims, d_model)).uniform_(-math.sqrt(1/(d_model)), math.sqrt(1/(d_model)))))
+        self.register_parameter('start_trace', nn.Parameter(torch.zeros((self.context_dims, d_model, memory_length)).uniform_(-math.sqrt(1/(d_model+memory_length)), math.sqrt(1/(d_model+memory_length)))))
 
         # --- Synchronisation ---
         self.neuron_select_type_out, self.neuron_select_type_action = self.get_neuron_select_type()
@@ -188,20 +188,21 @@ class ContinuousThoughtMachine(nn.Module):
                 elif synch_type == 'out': # Use first n_synch neurons for out
                     selected_left = selected_right = activated_state[:, :n_synch]
             else: # Use the randomly selected neurons
-                selected_left = activated_state[:, neuron_indices_left]
-                selected_right = activated_state[:, neuron_indices_right]
+                selected_left = activated_state[:, :, neuron_indices_left]
+                selected_right = activated_state[:, :, neuron_indices_right]
             
             # Compute outer product of selected neurons
-            outer = selected_left.unsqueeze(2) * selected_right.unsqueeze(1)
+            outer = selected_left.unsqueeze(-1) * selected_right.unsqueeze(-2)
             # Resulting matrix is symmetric, so we only need the upper triangle
             i, j = torch.triu_indices(n_synch, n_synch)
-            pairwise_product = outer[:, i, j]
+            pairwise_product = outer[:, :, i, j]
             
         elif self.neuron_select_type == 'random-pairing':
             # For random-pairing, we compute the sync between specific pairs of neurons
-            left = activated_state[:, neuron_indices_left]
-            right = activated_state[:, neuron_indices_right]
-            pairwise_product = left * right
+            # activated state is (B, H)
+            left = activated_state[:, :, neuron_indices_left] # (B, opt, n_synch)
+            right = activated_state[:, :, neuron_indices_right] # (B, opt, n_synch) 
+            pairwise_product = left * right # (B, opt, n_synch) 
         else:
             raise ValueError("Invalid neuron selection type")
         
@@ -209,7 +210,7 @@ class ContinuousThoughtMachine(nn.Module):
         
         # Compute synchronisation recurrently
         if decay_alpha is None or decay_beta is None:
-            decay_alpha = pairwise_product
+            decay_alpha = pairwise_product # (B, opt, n_synch)
             decay_beta = torch.ones_like(pairwise_product)
         else:
             decay_alpha = r * decay_alpha + pairwise_product
@@ -218,14 +219,13 @@ class ContinuousThoughtMachine(nn.Module):
         synchronisation = decay_alpha / (torch.sqrt(decay_beta))
         return synchronisation, decay_alpha, decay_beta
 
-    def compute_features(self, x):
+    def compute_features(self, x): # ----------------------------------------------------------
         """
         Compute the key-value features from the input data using the backbone. 
         """
-        initial_rgb = self.initial_rgb(x)
-        self.kv_features = self.backbone(initial_rgb)
+        self.kv_features = self.backbone(x)
         pos_emb = self.positional_embedding(self.kv_features)
-        combined_features = (self.kv_features + pos_emb).flatten(2).transpose(1, 2)
+        combined_features = (self.kv_features + pos_emb)
         kv = self.kv_proj(combined_features)
         return kv
 
@@ -237,23 +237,13 @@ class ContinuousThoughtMachine(nn.Module):
 
         For legacy reasons we stack that in a 2D vector as this can be used for optimisation later.
         """
-        B = current_prediction.size(0)
-        reshaped_pred = current_prediction.reshape([B] + self.prediction_reshaper)
-        ne = compute_normalized_entropy(reshaped_pred)
+        B, C = current_prediction.size(0), current_prediction.size(1)
+        reshaped_pred = current_prediction.reshape([B, C] + self.prediction_reshaper)
+        ne = compute_normalized_entropy(reshaped_pred, 'none') # Revisit later
         current_certainty = torch.stack((ne, 1-ne), -1)
         return current_certainty
 
     # --- Setup Methods ---
-
-    def set_initial_rgb(self):
-        """
-        This is largely to accommodate training on grayscale images and is legacy, but it
-        doesn't hurt the model in any way that we can tell.
-        """
-        if 'resnet' in self.backbone_type:
-            self.initial_rgb = nn.LazyConv2d(3, 1, 1) # Adapts input channels lazily
-        else:
-            self.initial_rgb = nn.Identity()
 
     def get_d_backbone(self):
         """
@@ -296,6 +286,11 @@ class ContinuousThoughtMachine(nn.Module):
             self.backbone = ParityBackbone(n_embeddings=2, d_embedding=d_backbone)
         elif 'resnet' in self.backbone_type:
             self.backbone = prepare_resnet_backbone(self.backbone_type)
+        elif self.backbone_type == 'gpt2':
+            self.embedding_model = AutoModel.from_pretrained('gpt2')
+            self.backbone = nn.Sequential(
+                self.embedding_model.get_input_embeddings()
+            )
         elif self.backbone_type == 'none':
             self.backbone = nn.Identity()
         else:
@@ -323,6 +318,10 @@ class ContinuousThoughtMachine(nn.Module):
             return LearnableFourierPositionalEncoding(d_backbone, gamma=1 / 2.5)
         elif self.positional_embedding_type == 'multi-learnable-fourier':
             return MultiLearnableFourierPositionalEncoding(d_backbone)
+        elif self.positional_embedding_type == 'multi-learnable-fourier-1d':
+            return MultiLearnableFourierPositionalEncoding1D(d_backbone)
+        elif self.positional_embedding_type == 'sinusoidal':
+            return SinusoidalPositionalEncoding(d_backbone)
         elif self.positional_embedding_type == 'custom-rotational':
             return CustomRotationalEmbedding(d_backbone)
         elif self.positional_embedding_type == 'custom-rotational-1d':
@@ -397,7 +396,7 @@ class ContinuousThoughtMachine(nn.Module):
             synch_representation_size = self.synch_representation_size_action if synch_type == 'action' else self.synch_representation_size_out
             self.register_buffer(f'{synch_type}_neuron_indices_left', left)
             self.register_buffer(f'{synch_type}_neuron_indices_right', right)
-            self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
+            self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(self.context_dims, synch_representation_size), requires_grad=True))
 
     def initialize_left_right_neurons(self, synch_type, d_model, n_synch, n_random_pairing_self=0):
         """
@@ -476,7 +475,7 @@ class ContinuousThoughtMachine(nn.Module):
 
 
 
-    def forward(self, x, track=False):
+    def forward(self, x, track=False, padding_mask=None):
         B = x.size(0)
         device = x.device
 
@@ -491,18 +490,20 @@ class ContinuousThoughtMachine(nn.Module):
         kv = self.compute_features(x)
 
         # --- Initialise Recurrent State ---
-        state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1) # Shape: (B, H, T)
-        activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1) # Shape: (B, H)
+        state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1, -1) # Shape: (B, context_dims, d_model, M)
+        activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1, -1) # Shape: (B, context_dims, d_model)
 
         # --- Prepare Storage for Outputs per Iteration ---
-        predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
-        certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
+        predictions = torch.empty(B, self.context_dims, self.out_dims, self.iterations, device=device, dtype=torch.float32)
+        certainties = torch.empty(B, self.context_dims, 2, self.iterations, device=device, dtype=torch.float32)
 
         # --- Initialise Recurrent Synch Values  ---
         decay_alpha_action, decay_beta_action = None, None
         self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)  # Fix from github user: kuviki
         self.decay_params_out.data = torch.clamp(self.decay_params_out, 0, 15)
         r_action, r_out = torch.exp(-self.decay_params_action).unsqueeze(0).repeat(B, 1), torch.exp(-self.decay_params_out).unsqueeze(0).repeat(B, 1)
+        
+        # r_action, r_out  |shapes|  (context_dims, n_synch), (context_dims, n_synch)
 
         _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, None, None, r_out, synch_type='out')
         # Compute learned weighting for synchronisation
@@ -513,29 +514,39 @@ class ContinuousThoughtMachine(nn.Module):
 
             # --- Calculate Synchronisation for Input Data Interaction ---
             synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action')
+            # (B, context_dims, n_synch), (B, context_dims, n_synch), (B, context_dims, n_synch)
+            # n_synch = d_chosen
 
             # --- Interact with Data via Attention ---
-            q = self.q_proj(synchronisation_action).unsqueeze(1)
-            attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
-            attn_out = attn_out.squeeze(1)
-            pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1)
+            q = self.q_proj(synchronisation_action) # (B, context_dims, d_input)
+            # kv is of shape (B, context_dims, L, d_input)
+            # q is of shape (B, context_dims, 1, d_input) 
+            # We have one query attending to all keys 
+            # softmax( (B, context_dims, d_input) @ (B, L, d_input).transpose(-2, -1) ) @ (B, L, d_input)
+            # attn_out is of shape (B, context_dims, d_input)
+            attn_out, attn_weights = self.attention(q, kv, kv,
+                                                    average_attn_weights=False,
+                                                    need_weights=True,
+                                                    key_padding_mask=padding_mask,
+                                                    is_causal=True)
+            pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1) # (B, context_dims, d_input + d_model)
 
             # --- Apply Synapses ---
-            state = self.synapses(pre_synapse_input)
+            state = self.synapses(pre_synapse_input) # (B, context_dims, d_model)
             # The 'state_trace' is the history of incoming pre-activations
-            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+            state_trace = torch.cat((state_trace[:, :, :, 1:], state.unsqueeze(-1)), dim=-1) # (B, context_dims, d_model, M)
 
             # --- Apply Neuron-Level Models ---
-            activated_state = self.trace_processor(state_trace)
+            activated_state = self.trace_processor(state_trace) # (B, context_dims, d_model)
             # One would also keep an 'activated_state_trace' as the history of outgoing post-activations
             # BUT, this is unnecessary because the synchronisation calculation is fully linear and can be
             # done using only the currect activated state (see compute_synchronisation method for explanation)
 
             # --- Calculate Synchronisation for Output Predictions ---
             synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
-
+            # (B, n_synch), (B, n_synch), (B, n_synch)
             # --- Get Predictions and Certainties ---
-            current_prediction = self.output_projector(synchronisation_out)
+            current_prediction = self.output_projector(synchronisation_out) # (B, context_dims, out_dims)
             current_certainty = self.compute_certainty(current_prediction)
 
             predictions[..., stepi] = current_prediction
